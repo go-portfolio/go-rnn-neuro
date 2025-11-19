@@ -110,53 +110,88 @@ func (rnn *RNN) forwardSequence(input []float64) ([][]float64, [][]float64) {
 	return ys, hs // Возвращаем массив выходов и скрытых состояний
 }
 
-func (rnn *RNN) forwardParallel(x []float64, hPrev []float64) ([]float64, []float64) {
-	hNew := make([]float64, rnn.hiddenDim) // Новый вектор скрытого состояния
-	y := make([]float64, rnn.outputDim)    // Вектор выхода
-	var wg sync.WaitGroup                   // Для синхронизации горутин
+// computeHiddenNeuron вычисляет активацию одного нейрона скрытого слоя.
+// x — текущий входной вектор (one-hot последовательность),
+// hPrev — скрытое состояние на предыдущем шаге,
+// i — индекс нейрона скрытого слоя
+func (rnn *RNN) computeHiddenNeuron(x []float64, hPrev []float64, i int) float64 {
+    // Начальное значение z — это смещение для i-го нейрона
+    z := rnn.bh[i]
 
-	// ------------------------- HIDDEN LAYER -------------------------
-	for i := 0; i < rnn.hiddenDim; i++ {
-		i := i // Захват переменной для горутины
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			z := rnn.bh[i] // Начинаем с смещения скрытого слоя
+    // Вклад входного слоя: сумма входов, умноженных на соответствующие веса Wx
+    for j := 0; j < rnn.inputDim; j++ {
+        z += rnn.Wx[j+rnn.inputDim*i] * x[j]
+    }
 
-			// Суммируем вклад входов
-			for j := 0; j < rnn.inputDim; j++ {
-				z += rnn.Wx[j+rnn.inputDim*i] * x[j] // Индексация весов: Wx[inputDim*i + j]
-			}
+    // Вклад скрытого слоя: сумма предыдущих скрытых состояний, умноженных на веса Wh
+    for j := 0; j < rnn.hiddenDim; j++ {
+        z += rnn.Wh[j+rnn.hiddenDim*i] * hPrev[j]
+    }
 
-			// Суммируем вклад предыдущего скрытого состояния
-			for j := 0; j < rnn.hiddenDim; j++ {
-				z += rnn.Wh[j+rnn.hiddenDim*i] * hPrev[j] // Wh[hiddenDim*i + j]
-			}
-
-			hNew[i] = activateHidden(z) // Активация tanh
-		}()
-	}
-	wg.Wait() // Ждем окончания всех горутин скрытого слоя
-
-	// ------------------------- OUTPUT LAYER -------------------------
-	for i := 0; i < rnn.outputDim; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			z := rnn.by[i] // Начальное смещение выходного слоя
-
-			for j := 0; j < rnn.hiddenDim; j++ {
-				z += rnn.Wy[j+rnn.hiddenDim*i] * hNew[j] // Вклад скрытого состояния
-			}
-
-			y[i] = z
-		}()
-	}
-	wg.Wait()          // Ждем окончания всех горутин выходного слоя
-	y = activateOutput(y) // Softmax активация выхода
-	return y, hNew
+    // Пропускаем через функцию активации tanh и возвращаем новое скрытое состояние нейрона
+    return activateHidden(z)
 }
+
+// computeHiddenLayer вычисляет все скрытые состояния слоя на текущем шаге
+// с использованием параллельных горутин для каждого нейрона
+func (rnn *RNN) computeHiddenLayer(x []float64, hPrev []float64) []float64 {
+    // Создаём слайс для новых скрытых состояний
+    hNew := make([]float64, rnn.hiddenDim)
+    var wg sync.WaitGroup // sync.WaitGroup для ожидания завершения всех горутин
+
+    // Параллельный запуск вычисления каждого нейрона скрытого слоя
+    for i := 0; i < rnn.hiddenDim; i++ {
+        i := i // захватываем локальную копию переменной для горутины
+        wg.Add(1)
+        go func() {
+            defer wg.Done() // уменьшаем счетчик wg по завершению горутины
+            hNew[i] = rnn.computeHiddenNeuron(x, hPrev, i) // вычисляем активацию нейрона
+        }()
+    }
+
+    // Ждём, пока все горутины закончат работу
+    wg.Wait()
+
+    return hNew // возвращаем весь вектор скрытых состояний
+}
+
+// forwardParallel вычисляет один шаг прямого прохода RNN
+// x — текущий входной вектор
+// hPrev — скрытое состояние предыдущего шага
+// возвращает: y — выходной вектор (после softmax), hNew — новое скрытое состояние
+func (rnn *RNN) forwardParallel(x []float64, hPrev []float64) ([]float64, []float64) {
+    // Вычисляем скрытый слой на текущем шаге
+    hNew := rnn.computeHiddenLayer(x, hPrev)
+
+    // Создаём слайс для выходного слоя
+    y := make([]float64, rnn.outputDim)
+    var wg sync.WaitGroup // для параллельного вычисления выходных нейронов
+
+    // Параллельное вычисление выходного слоя
+    for i := 0; i < rnn.outputDim; i++ {
+        i := i // захватываем локальную копию переменной для горутины
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            z := rnn.by[i] // начинаем с bias для i-го выходного нейрона
+
+            // Вклад скрытого слоя: сумма произведений скрытых состояний на веса Wy
+            for j := 0; j < rnn.hiddenDim; j++ {
+                z += rnn.Wy[j+rnn.hiddenDim*i] * hNew[j]
+            }
+            y[i] = z // сохраняем линейную комбинацию перед активацией
+        }()
+    }
+
+    // Ждём, пока все горутины закончат вычисление выхода
+    wg.Wait()
+
+    // Применяем softmax для получения вероятностей на выходе
+    y = activateOutput(y)
+
+    return y, hNew // возвращаем выход и новое скрытое состояние
+}
+
 
 // ------------------------- ACTIVATION -------------------------
 func activateHidden(z float64) float64 {
