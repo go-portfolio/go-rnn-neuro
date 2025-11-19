@@ -191,48 +191,84 @@ func (rnn *RNN) Train(inputs [][]float64, outputs [][]float64, epochs int, learn
 }
 
 // ------------------------- FORWARD (PARALLEL) -------------------------
-// forwardParallel выполняет прямой проход с параллельной обработкой нейронов
+// ------------------------- ACTIVATIONS -------------------------
+
+// Активация скрытого слоя (tanh)
+func activateHidden(z float64) float64 {
+	return math.Tanh(z)
+}
+
+// Активация выходного слоя (softmax)
+func activateOutput(logits []float64) []float64 {
+	max := logits[0]
+	for _, v := range logits {
+		if v > max {
+			max = v
+		}
+	}
+
+	expSum := 0.0
+	out := make([]float64, len(logits))
+	for i, v := range logits {
+		out[i] = math.Exp(v - max)
+		expSum += out[i]
+	}
+
+	for i := range out {
+		out[i] /= expSum
+	}
+	return out
+}
+
+// ------------------------- FORWARD -------------------------
+
+// forwardParallel выполняет прямой проход с явными активациями
 func (rnn *RNN) forwardParallel(x []float64, hPrev []float64) ([]float64, []float64) {
 	hNew := make([]float64, rnn.hiddenDim)
 	y := make([]float64, rnn.outputDim)
 	var wg sync.WaitGroup
 
-	// ------------------------- hNew -------------------------
+	// ------------------------- HIDDEN LAYER -------------------------
 	for i := 0; i < rnn.hiddenDim; i++ {
 		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			hNew[i] = rnn.bh[i]
+			// Суммируем вход и рекуррентное состояние + смещение
+			z := rnn.bh[i]
 			for j := 0; j < rnn.inputDim; j++ {
-				hNew[i] += rnn.Wx[j+rnn.inputDim*i] * x[j]
+				z += rnn.Wx[j+rnn.inputDim*i] * x[j]
 			}
 			for j := 0; j < rnn.hiddenDim; j++ {
-				hNew[i] += rnn.Wh[j+rnn.hiddenDim*i] * hPrev[j]
+				z += rnn.Wh[j+rnn.hiddenDim*i] * hPrev[j]
 			}
-			hNew[i] = tanh(hNew[i])
+			// Применяем явную функцию активации скрытого слоя
+			hNew[i] = activateHidden(z)
 		}()
 	}
 	wg.Wait()
 
-	// ------------------------- y -------------------------
+	// ------------------------- OUTPUT LAYER -------------------------
 	for i := 0; i < rnn.outputDim; i++ {
 		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			y[i] = rnn.by[i]
+			z := rnn.by[i]
 			for j := 0; j < rnn.hiddenDim; j++ {
-				y[i] += rnn.Wy[j+rnn.hiddenDim*i] * hNew[j]
+				z += rnn.Wy[j+rnn.hiddenDim*i] * hNew[j]
 			}
+			y[i] = z
 		}()
 	}
 	wg.Wait()
 
-	// ------------------------- SOFTMAX -------------------------
-	y = softmaxParallel(y)
+	// Применяем явную функцию активации выхода (softmax)
+	y = activateOutput(y)
 	return y, hNew
 }
+
+
 
 // ------------------------- SOFTMAX (PARALLEL) -------------------------
 func softmaxParallel(logits []float64) []float64 {
